@@ -567,7 +567,10 @@ export function createAppPageEntrypoint({
     // after the head, where HTML-limited bots cannot observe it. Bypass the
     // shell so blocking metadata is included in the initial document head.
     const shouldForceDynamicPPRRender =
-      isRoutePPREnabled && !serveStreamingMetadata
+      isRoutePPREnabled &&
+      !serveStreamingMetadata &&
+      !isPrerendered &&
+      !prerenderManifest.routes[normalizedSrcPage]
 
     const isSSG = Boolean(
       (prerenderInfo ||
