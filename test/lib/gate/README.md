@@ -83,9 +83,11 @@ fails the whole suite at collection time rather than silently disabling the gate
 There are two tiers:
 
 - **static** — the run's own shape (`dev`, `start`, `deploy`, `mode`,
-  `turbopack`, `rspack`, `webpack`, `bundler`, `react18`, `wasm`, `ci`),
-  semantic aliases for `!dev` that state the reason rather than the mode
-  (`prod`, `prefetching`), plus `FIXME` / `TODO`, which are always false.
+  `turbopack`, `rspack`, `webpack`, `bundler`, `react18`, `wasm`, `linux`,
+  `macos`, `windows`, `ci`), semantic aliases for `!dev` that state the reason
+  rather than the mode (`prod`, `prefetching`), specialized CI variants
+  (`adapter`, `nodeMiddleware`, `standaloneOutput`, `turbopackDev`,
+  `turbopackBuild`), plus `FIXME` / `TODO`, which are always false.
 - **lazy** — a predicate over the fixture's *resolved* `next.config`
   (`cacheComponents`, `ppr`, `prefetchInlining`, `output`, …), read the first
   time a gate asks for it.
@@ -190,9 +192,11 @@ var is not what the fixture actually resolved.
 ## How it works
 
 1. `pragma-transform.js` rewrites the pragma into
-   `_test_gate([{force,source}], 'it')(...)`. It is a line-oriented regex, not an
-   AST transform, so **only the `it(` line changes** and every other line keeps
-   its byte offsets — `toMatchInlineSnapshot()` is written back by line/column.
+   `_test_gate([{force,source}], 'it')(...)`. `describe.each` uses the analogous
+   `_test_gate_describe_each([{force,source}], table)(...)` helper. It is a
+   line-oriented regex, not an AST transform, so **only the call line changes**
+   and every other line keeps its byte offsets — `toMatchInlineSnapshot()` is
+   written back by line/column.
 2. `jest-transformer.js` chains that rewrite in front of the SWC transformer
    `next/jest` configures. `jest.config.js` wires it up with
    `withGateTransformer()`.
@@ -231,9 +235,6 @@ A suite with no lazy gate never resolves a config, so the cost is zero.
   matchers) still fails the test. Hooks registered inside a `describe` whose
   lazy `@force-gate` is false are the one exception: the suite's build and
   tests are skipped, so its hooks are skipped too.
-- `jest.retryTimes(1)` is on for non-dev CI. A stale gate fails deterministically
-  on both attempts, but a *flaky* gated-false test now "passes" whenever it
-  happens to fail.
 - A gated test's title is unchanged (React renames its to
   `[GATED, SHOULD FAIL] …`; we can't, because a lazy gate is not decided when
   titles are fixed). The `⚠ gated test failed as expected` line is the only

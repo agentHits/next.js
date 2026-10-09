@@ -1,5 +1,8 @@
 import type { ActionManifest } from '../../build/webpack/plugins/flight-client-entry-plugin'
-import type { ClientReferenceManifest } from '../../build/webpack/plugins/flight-manifest-plugin'
+import type {
+  ClientReferenceManifest,
+  ManifestChunks,
+} from '../../build/webpack/plugins/flight-manifest-plugin'
 import type { DeepReadonly } from '../../shared/lib/deep-readonly'
 import { InvariantError } from '../../shared/lib/invariant-error'
 import { normalizeAppPath } from '../../shared/lib/router/utils/app-paths'
@@ -8,6 +11,10 @@ import { removePathPrefix } from '../../shared/lib/router/utils/remove-path-pref
 import { mightBeServerReferenceId } from '../../shared/lib/server-reference-info'
 import { wellKnownProperties } from '../../shared/lib/utils/reflect-utils'
 import { workAsyncStorage } from './work-async-storage.external'
+import {
+  workUnitAsyncStorage,
+  type WorkUnitStore,
+} from './work-unit-async-storage.external'
 
 export interface ServerModuleMap {
   readonly [name: string]: {
@@ -49,6 +56,109 @@ export function getInvalidServerReferenceIdError(id: string): Error {
 const MAX_LOGGED_SERVER_REFERENCE_ID_LENGTH = 100
 const TRUNCATED_SERVER_REFERENCE_ID_LENGTH = 90
 
+const EMPTY_CHUNKS: ManifestChunks = Object.freeze([])
+const internedChunksPool = new Map<string, ManifestChunks>()
+
+export function internChunks(chunks: ManifestChunks): ManifestChunks {
+  if (!chunks || chunks.length === 0) return EMPTY_CHUNKS
+  const key = chunks.join('|')
+  let existing = internedChunksPool.get(key)
+  if (!existing) {
+    internedChunksPool.set(key, chunks)
+    existing = chunks
+  }
+  return existing
+}
+
+function getDedupedClientModuleEntry<T extends { chunks?: ManifestChunks }>(
+  entry: T,
+  workUnitStore: WorkUnitStore
+): T {
+  if (!entry || !entry.chunks || entry.chunks.length === 0) {
+    return entry
+  }
+
+  workUnitStore.emittedChunkIds ??= new Set<string>()
+  const emitted = workUnitStore.emittedChunkIds
+  const entryChunks = entry.chunks
+
+  const isWebpackChunks =
+    entryChunks.length % 2 === 0 &&
+    typeof entryChunks[0] === 'string' &&
+    typeof entryChunks[1] === 'string' &&
+    (entryChunks[1].endsWith('.js') ||
+      entryChunks[1].includes('.js?') ||
+      entryChunks[1].endsWith('.css') ||
+      entryChunks[1].includes('.css?'))
+
+  if (isWebpackChunks) {
+    let hasUnemitted = false
+    for (let i = 0; i < entryChunks.length; i += 2) {
+      if (!emitted.has(entryChunks[i])) {
+        hasUnemitted = true
+        break
+      }
+    }
+
+    if (!hasUnemitted) {
+      return {
+        ...entry,
+        chunks: EMPTY_CHUNKS,
+      }
+    }
+
+    const newChunks: string[] = []
+    for (let i = 0; i < entryChunks.length; i += 2) {
+      const chunkId = entryChunks[i]
+      if (!emitted.has(chunkId)) {
+        emitted.add(chunkId)
+        newChunks.push(chunkId, entryChunks[i + 1])
+      }
+    }
+
+    return {
+      ...entry,
+      chunks: newChunks,
+    }
+  } else {
+    let hasUnemitted = false
+    for (let i = 0; i < entryChunks.length; i++) {
+      const c = entryChunks[i]
+      const chunkKey = typeof c === 'string' ? c : (c as any)[0]
+      if (typeof chunkKey === 'string' && !emitted.has(chunkKey)) {
+        hasUnemitted = true
+        break
+      }
+    }
+
+    if (!hasUnemitted) {
+      return {
+        ...entry,
+        chunks: EMPTY_CHUNKS,
+      }
+    }
+
+    const newChunks: any[] = []
+    for (let i = 0; i < entryChunks.length; i++) {
+      const c = entryChunks[i]
+      const chunkKey = typeof c === 'string' ? c : (c as any)[0]
+      if (typeof chunkKey === 'string') {
+        if (!emitted.has(chunkKey)) {
+          emitted.add(chunkKey)
+          newChunks.push(c)
+        }
+      } else {
+        newChunks.push(c)
+      }
+    }
+
+    return {
+      ...entry,
+      chunks: newChunks,
+    }
+  }
+}
+
 // This is a global singleton that is, among other things, also used to
 // encode/decode bound args of server function closures. This can't be using a
 // AsyncLocalStorage as it might happen at the module level.
@@ -71,6 +181,9 @@ interface ManifestsSingleton {
     RegisteredClientReferenceManifest
   >
   readonly proxiedClientReferenceManifest: DeepReadonly<ClientReferenceManifest>
+  readonly rscModuleMappingForUseCache: DeepReadonly<
+    ClientReferenceManifest['rscModuleMapping']
+  >
   serverActionsManifest: DeepReadonly<ActionManifest>
   serverModuleMap: ServerModuleMap
 }
@@ -88,12 +201,38 @@ type ClientReferenceManifestMappingProp =
 
 const globalThisWithManifests = globalThis as GlobalThisWithManifests
 
+function isUseCacheStore(workUnitStore: WorkUnitStore | undefined): boolean {
+  if (!workUnitStore) {
+    return false
+  }
+
+  switch (workUnitStore.type) {
+    case 'cache':
+    case 'private-cache':
+      return true
+    case 'request':
+    case 'unstable-cache':
+    case 'prerender':
+    case 'prerender-client':
+    case 'prerender-legacy':
+    case 'prerender-runtime':
+    case 'validation-client':
+    case 'build-time-generator':
+      return false
+    default:
+      return workUnitStore satisfies never
+  }
+}
+
 function createProxiedClientReferenceManifest(
   clientReferenceManifestsPerRoute: Map<
     string,
     RegisteredClientReferenceManifest
   >
-): DeepReadonly<ClientReferenceManifest> {
+): Pick<
+  ManifestsSingleton,
+  'proxiedClientReferenceManifest' | 'rscModuleMappingForUseCache'
+> {
   const createMappingProxy = (prop: ClientReferenceManifestMappingProp) => {
     return new Proxy(
       {},
@@ -107,6 +246,51 @@ function createProxiedClientReferenceManifest(
             )?.clientReferenceManifest
 
             if (currentManifest?.[prop][id]) {
+              if (
+                workStore.durableUseCacheEntries &&
+                prop === 'clientModules'
+              ) {
+                const workUnitStore = workUnitAsyncStorage.getStore()
+                if (isUseCacheStore(workUnitStore)) {
+                  // This creates a mapping so that a given client references with name
+                  // `app/foo/client.tsx` is serialized as
+                  // ```
+                  // { id: `app/foo/client.tsx`, name: `*`, chunks: ["stub"], async: false }
+                  // ```
+                  // instead of the actual
+                  // ```
+                  // { id: 19132, name: `*`, chunks: ["/_next/static/chunks/..."], async: true }
+                  // ```
+                  //
+                  // This means that not the unstable client module id is used for the cache entry,
+                  // but the stable client reference name. The stable client reference name is
+                  // resolved against the current manifest via rscModuleMappingForUseCache when the
+                  // entry is read.
+                  const clientReferenceManifestEntry =
+                    currentManifest.clientModules[id]
+                  return {
+                    // Return `id` instead of `clientReferenceManifestEntry.id` here.
+                    id,
+                    name: clientReferenceManifestEntry.name,
+                    // Set a sentinel value just in case this does ends up being read at some point
+                    // in the future, then at least we'll get "Failed to load chunk stub (404)"
+                    // instead of "Failed to load module 1234".
+                    chunks: ['stub'],
+                    async: false,
+                  }
+                }
+              }
+
+              if (prop === 'clientModules') {
+                const workUnitStore = workUnitAsyncStorage.getStore()
+                if (workUnitStore && !isUseCacheStore(workUnitStore)) {
+                  return getDedupedClientModuleEntry(
+                    currentManifest.clientModules[id],
+                    workUnitStore
+                  )
+                }
+              }
+
               return currentManifest[prop][id]
             }
 
@@ -139,6 +323,13 @@ function createProxiedClientReferenceManifest(
                     workStore.additionalClientReferenceManifestPages ??=
                       new Set()
                     workStore.additionalClientReferenceManifestPages.add(page)
+                  }
+
+                  if (prop === 'clientModules') {
+                    const workUnitStore = workUnitAsyncStorage.getStore()
+                    if (workUnitStore && !isUseCacheStore(workUnitStore)) {
+                      return getDedupedClientModuleEntry(entry, workUnitStore)
+                    }
                   }
 
                   return entry
@@ -174,7 +365,7 @@ function createProxiedClientReferenceManifest(
     ReturnType<typeof createMappingProxy>
   >()
 
-  return new Proxy(
+  const proxiedClientReferenceManifest = new Proxy(
     {},
     {
       get(_, prop) {
@@ -225,6 +416,47 @@ function createProxiedClientReferenceManifest(
       },
     }
   ) as DeepReadonly<ClientReferenceManifest>
+
+  // Performs the inverse of the clientModules isUseCacheStore(workUnitStore) special case above:
+  //
+  // For cache functions, don't do the usual rscModuleMapping lookup by module ID, but instead look
+  // up by the stable client reference name. This is because cache entries must not depend on
+  // build-local module IDs or chunks. So we need a second layer of indirection here to do client
+  // reference name -> client module id -> rsc module mapping lookup.
+  //
+  // This one is created separately (not inside proxiedClientReferenceManifest.rscModuleMapping) as
+  // we don't necessarily are inside a workUnitStore when we need to access this mapping (as opposed
+  // to the clientModules mapping, which always has the ALS set).
+  const rscModuleMappingForUseCache = new Proxy(
+    {},
+    {
+      get(
+        _,
+        key: string
+      ): ClientReferenceManifest['rscModuleMapping'][string] | undefined {
+        const workStore = workAsyncStorage.getStore()
+        if (workStore && workStore.durableUseCacheEntries) {
+          const currentManifest = clientReferenceManifestsPerRoute.get(
+            workStore.route
+          )?.clientReferenceManifest
+
+          const clientReferenceName = key
+          const clientReferenceManifestEntry =
+            currentManifest?.clientModules[clientReferenceName]
+          if (clientReferenceManifestEntry === undefined) {
+            return undefined
+          }
+
+          const clientModuleId = clientReferenceManifestEntry.id
+          return currentManifest?.rscModuleMapping[clientModuleId]
+        } else {
+          return proxiedClientReferenceManifest.rscModuleMapping[key]
+        }
+      },
+    }
+  ) as DeepReadonly<ClientReferenceManifest['rscModuleMapping']>
+
+  return { proxiedClientReferenceManifest, rscModuleMappingForUseCache }
 }
 
 /**
@@ -267,8 +499,8 @@ function createServerModuleMap(): ServerModuleMap {
             async: boolean
             durability?: {
               codeHash: string
-              runtimeEnvVars: readonly string[]
-              referencesClientComponent?: boolean
+              runtimeEnvVarsRead: readonly string[]
+              runtimeEnvVarsExistence: readonly string[]
             }
           }
         | undefined
@@ -384,13 +616,13 @@ export function setManifestsSingleton({
       RegisteredClientReferenceManifest
     >([[route, { page, clientReferenceManifest }]])
 
-    const proxiedClientReferenceManifest = createProxiedClientReferenceManifest(
-      clientReferenceManifestsPerRoute
-    )
+    const { proxiedClientReferenceManifest, rscModuleMappingForUseCache } =
+      createProxiedClientReferenceManifest(clientReferenceManifestsPerRoute)
 
     globalThisWithManifests[MANIFESTS_SINGLETON] = {
       clientReferenceManifestsPerRoute,
       proxiedClientReferenceManifest,
+      rscModuleMappingForUseCache,
       serverActionsManifest,
       serverModuleMap: createServerModuleMap(),
     }
@@ -407,8 +639,27 @@ function getManifestsSingleton(): ManifestsSingleton {
   return manifestSingleton
 }
 
+/**
+ * Returns the usual client_reference_manifest.json.
+ *
+ * In dev, it also looks up references of other pages (due to overlapping processing on
+ * navigations).
+ *
+ * Inside a use-cache workUnitStore, clientModules instead map to a stable dummy value (see comments
+ * above).
+ */
 export function getClientReferenceManifest(): DeepReadonly<ClientReferenceManifest> {
   return getManifestsSingleton().proxiedClientReferenceManifest
+}
+
+/**
+ * A mapping of client reference names to the RSC module id. (So a double lookup of clientModules ->
+ * rscModuleMapping)
+ */
+export function getRscModuleMappingForUseCache(): DeepReadonly<
+  ClientReferenceManifest['rscModuleMapping']
+> {
+  return getManifestsSingleton().rscModuleMappingForUseCache
 }
 
 export function getServerActionsManifest(): DeepReadonly<ActionManifest> {

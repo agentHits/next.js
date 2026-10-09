@@ -49,6 +49,7 @@ import { ReactLoadablePlugin } from './webpack/plugins/react-loadable-plugin'
 import { WellKnownErrorsPlugin } from './webpack/plugins/wellknown-errors-plugin'
 import { regexLikeCss } from './webpack/config/blocks/css'
 import { CopyFilePlugin } from './webpack/plugins/copy-file-plugin'
+import { needsPolyfill } from './polyfills/needs-polyfill'
 import { ClientReferenceManifestPlugin } from './webpack/plugins/flight-manifest-plugin'
 import { FlightClientEntryPlugin as NextFlightClientEntryPlugin } from './webpack/plugins/flight-client-entry-plugin'
 import { RspackFlightClientEntryPlugin } from './webpack/plugins/rspack-flight-client-entry-plugin'
@@ -81,7 +82,7 @@ import {
   createNextApiEsmAliases,
   createAppRouterApiAliases,
 } from './create-compiler-aliases'
-import { hasCustomExportOutput } from '../export/utils'
+import { getBuildDistDir } from '../export/utils'
 import { CssChunkingPlugin } from './webpack/plugins/css-chunking-plugin'
 import {
   getBabelLoader,
@@ -338,8 +339,6 @@ export default async function getBaseWebpackConfig(
     isDevFallback = false,
     pagesDir,
     rewrites,
-    originalRewrites,
-    originalRedirects,
     runWebpackSpan,
     appDir,
     middlewareMatchers,
@@ -366,8 +365,6 @@ export default async function getBaseWebpackConfig(
     isDevFallback?: boolean
     pagesDir: string | undefined
     rewrites: CustomRoutes['rewrites']
-    originalRewrites: CustomRoutes['rewrites'] | undefined
-    originalRedirects: CustomRoutes['redirects'] | undefined
     runWebpackSpan: Span
     appDir: string | undefined
     middlewareMatchers?: ProxyMatcher[]
@@ -421,10 +418,8 @@ export default async function getBaseWebpackConfig(
 
   const babelConfigFile = getBabelConfigFile(dir)
 
-  if (!dev && hasCustomExportOutput(config)) {
-    config.distDir = '.next'
-  }
-  const distDir = path.join(dir, config.distDir)
+  const buildDistDir = dev ? config.distDir : getBuildDistDir(config)
+  const distDir = path.join(dir, buildDistDir)
 
   let useSWCLoader = !babelConfigFile || config.experimental.forceSwcTransforms
   let SWCBinaryTarget: [Feature, boolean] | undefined = undefined
@@ -548,12 +543,7 @@ export default async function getBaseWebpackConfig(
           hasReactRefresh: dev && isClient,
           transpilePackages: finalTranspilePackages,
           supportedBrowsers,
-          swcCacheDir: path.join(
-            dir,
-            config?.distDir ?? '.next',
-            'cache',
-            'swc'
-          ),
+          swcCacheDir: path.join(distDir, 'cache', 'swc'),
           serverReferenceHashSalt: encryptionKey,
 
           // rspack specific options
@@ -588,7 +578,7 @@ export default async function getBaseWebpackConfig(
         jsConfig,
         transpilePackages: finalTranspilePackages,
         supportedBrowsers,
-        swcCacheDir: path.join(dir, config?.distDir ?? '.next', 'cache', 'swc'),
+        swcCacheDir: path.join(distDir, 'cache', 'swc'),
         serverReferenceHashSalt: encryptionKey,
         ...extraOptions,
       } satisfies SWCLoaderOptions,
@@ -1984,12 +1974,7 @@ export default async function getBaseWebpackConfig(
                 loader: 'next-barrel-loader',
                 options: {
                   names,
-                  swcCacheDir: path.join(
-                    dir,
-                    config?.distDir ?? '.next',
-                    'cache',
-                    'swc'
-                  ),
+                  swcCacheDir: path.join(distDir, 'cache', 'swc'),
                 },
                 // This is part of the request value to serve as the module key.
                 // The barrel loader are no-op re-exported modules keyed by
@@ -2174,7 +2159,22 @@ export default async function getBaseWebpackConfig(
         ? new RspackProfilingPlugin({ runWebpackSpan })
         : new ProfilingPlugin({ runWebpackSpan, rootDir: dir }),
       new WellKnownErrorsPlugin(),
+      // When the project's browserslist targets all support the polyfilled
+      // APIs natively, replace the polyfill module with an empty noop to
+      // save ~14 KiB from the client bundle and silence the Lighthouse
+      // "Legacy JavaScript" audit.
+      // See https://github.com/vercel/next.js/issues/86785
       isClient &&
+        supportedBrowsers &&
+        !needsPolyfill(supportedBrowsers) &&
+        new bundler.NormalModuleReplacementPlugin(
+          /[/\\]polyfill-module(?:\.js)?$/,
+          require.resolve('./polyfills/noop')
+        ),
+      // Skip the nomodule polyfill bundle when all target browsers
+      // support ES modules and the polyfilled APIs natively.
+      isClient &&
+        (!supportedBrowsers || needsPolyfill(supportedBrowsers)) &&
         new CopyFilePlugin({
           // file path to build output of `@next/polyfill-nomodule`
           filePath: require.resolve('./polyfills/polyfill-nomodule'),
@@ -2204,13 +2204,11 @@ export default async function getBaseWebpackConfig(
         !isClient &&
         new NextTypesPlugin({
           dir,
-          distDir: config.distDir,
+          distDir: buildDistDir,
           appDir,
           dev,
           isEdgeServer,
           pageExtensions: config.pageExtensions,
-          originalRewrites,
-          originalRedirects,
         }),
       !dev &&
         isClient &&
